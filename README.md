@@ -47,8 +47,8 @@ Il permet d’identifier rapidement :
 Cloner le dépôt :
 
 ```bash
-git clone https://github.com/ton-utilisateur/ruban-monitor.git
-cd ruban-monitor
+git clone https://github.com/Fifoudu388/ruban_bot.git
+cd ruban_bot
 ```
 
 Installer les dépendances :
@@ -76,7 +76,7 @@ win10toast
 ### Lancement simple
 
 ```bash
-python ruban_monitor.py gtfs.zip https://url_du_flux_gtfs_rt
+python main.py gtfs.zip https://app.pysae.com/api/v2/groups/keolis-9cc4/gtfs-rt
 ```
 
 ### Options disponibles
@@ -92,7 +92,7 @@ python ruban_monitor.py gtfs.zip https://url_du_flux_gtfs_rt
 ### Exemple
 
 ```bash
-python ruban_monitor.py gtfs.zip https://exemple.com/vehiclePositions.pb --interval 30 --alert-only
+python main.py gtfs.zip https://app.pysae.com/api/v2/groups/keolis-9cc4/gtfs-rt --interval 30 --alert-only
 ```
 
 ---
