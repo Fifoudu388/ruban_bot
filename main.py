@@ -15,7 +15,7 @@ from colorama import init, Fore, Style
 init(autoreset=True)
 
 # Notifications Windows (optionnelles)
-from win10toast_pager import ToastNotifier
+from win10toast import ToastNotifier
 toaster = ToastNotifier()
 
 HISTORY_FILE = "ruban_history.json"
