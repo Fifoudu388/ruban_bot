@@ -9,50 +9,46 @@ import time
 import os
 import json
 from collections import defaultdict
-
-# Couleurs console
 from colorama import init, Fore, Style
+
 init(autoreset=True)
 
 HISTORY_FILE = "ruban_history.json"
+LOG_FILE = "ruban_log.txt"
 
-# ------------------------------------------------------------
-# Chargement GTFS
-# ------------------------------------------------------------
 def load_gtfs_data(zip_path):
-    with zipfile.ZipFile(zip_path, 'r') as z:
-        required = ['routes.txt', 'trips.txt', 'stop_times.txt', 'stops.txt', 'calendar.txt']
-        gtfs_data = {}
-        for file in required:
-            if file not in z.namelist():
-                raise FileNotFoundError(f"Fichier manquant : {file}")
-            df = pd.read_csv(z.open(file))
-            gtfs_data[file.split('.')[0]] = df
+    """Charge les données GTFS depuis un fichier zip et retourne un dictionnaire de DataFrames."""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as z:
+            required = ['routes.txt', 'trips.txt', 'stop_times.txt', 'stops.txt', 'calendar.txt']
+            gtfs_data = {}
+            for file in required:
+                if file not in z.namelist():
+                    raise FileNotFoundError(f"Fichier manquant : {file}")
+                gtfs_data[file.split('.')[0]] = pd.read_csv(z.open(file))
 
-        if 'calendar_dates.txt' in z.namelist():
-            df = pd.read_csv(z.open('calendar_dates.txt'))
-            df['date'] = pd.to_numeric(df['date'], errors='coerce').fillna(0).astype(int)
-            gtfs_data['calendar_dates'] = df
-        else:
-            gtfs_data['calendar_dates'] = pd.DataFrame(columns=['service_id', 'date', 'exception_type'])
+            if 'calendar_dates.txt' in z.namelist():
+                gtfs_data['calendar_dates'] = pd.read_csv(z.open('calendar_dates.txt'))
+                gtfs_data['calendar_dates']['date'] = pd.to_numeric(gtfs_data['calendar_dates']['date'], errors='coerce').fillna(0).astype(int)
+            else:
+                gtfs_data['calendar_dates'] = pd.DataFrame(columns=['service_id', 'date', 'exception_type'])
 
-        cal = gtfs_data['calendar']
-        cal['start_date'] = pd.to_numeric(cal['start_date'], errors='coerce').fillna(0).astype(int)
-        cal['end_date'] = pd.to_numeric(cal['end_date'], errors='coerce').fillna(0).astype(int)
+            gtfs_data['calendar']['start_date'] = pd.to_numeric(gtfs_data['calendar']['start_date'], errors='coerce').fillna(0).astype(int)
+            gtfs_data['calendar']['end_date'] = pd.to_numeric(gtfs_data['calendar']['end_date'], errors='coerce').fillna(0).astype(int)
 
-        return gtfs_data
+            return gtfs_data
+    except Exception as e:
+        print(Fore.RED + f"Erreur lors du chargement du GTFS : {e}")
+        raise
 
-# ------------------------------------------------------------
-# Services actifs & courses en cours
-# ------------------------------------------------------------
 def get_active_service_ids(gtfs_data, today_date):
+    """Retourne les IDs des services actifs pour la date donnée."""
     calendar = gtfs_data['calendar']
     calendar_dates = gtfs_data['calendar_dates']
     ymd = int(today_date.strftime('%Y%m%d'))
-
-    active = set()
     weekday = today_date.strftime('%A').lower()
 
+    active = set()
     if weekday in calendar.columns:
         mask = (
             (calendar['start_date'] <= ymd) &
@@ -69,22 +65,27 @@ def get_active_service_ids(gtfs_data, today_date):
 
     return active
 
+def parse_gtfs_time(time_str, base_datetime):
+    """Convertit une chaîne GTFS (HH:MM:SS) en datetime."""
+    if pd.isna(time_str):
+        return None
+    hours, minutes, seconds = map(int, str(time_str).strip().split(':'))
+    return base_datetime + timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
 def get_scheduled_trips_now(gtfs_data, now_datetime):
+    """Retourne les trips prévus à l'heure actuelle."""
     trips = gtfs_data['trips']
     stop_times = gtfs_data['stop_times']
     today = now_datetime.date()
-
     services = get_active_service_ids(gtfs_data, today)
     if not services:
         return set()
 
     active_trips = trips[trips['service_id'].isin(services)]['trip_id']
-
     bounds = stop_times.groupby('trip_id').agg(
         start=('departure_time', 'min'),
         end=('arrival_time', 'max')
     ).reset_index()
-
     bounds = bounds[bounds['trip_id'].isin(active_trips)]
 
     scheduled = set()
@@ -103,39 +104,31 @@ def get_scheduled_trips_now(gtfs_data, now_datetime):
 
     return scheduled
 
-# ------------------------------------------------------------
-# Utilitaires temps & prochain arrêt
-# ------------------------------------------------------------
-def parse_gtfs_time(time_str, base_datetime):
-    if pd.isna(time_str):
-        return None
-    hours, minutes, seconds = map(int, str(time_str).strip().split(':'))
-    return base_datetime + timedelta(hours=hours, minutes=minutes, seconds=seconds)
-
 def get_next_stop(trip_id, current_stop_sequence, gtfs_data):
+    """Retourne le nom du prochain arrêt pour un trip donné."""
     stop_times = gtfs_data['stop_times']
     stops = gtfs_data['stops']
-    
     trip_stops = stop_times[stop_times['trip_id'] == trip_id].sort_values('stop_sequence')
-    
+
     if trip_stops.empty or current_stop_sequence is None:
         return "Inconnu"
-    
+
     next_seq = current_stop_sequence + 1
     next_row = trip_stops[trip_stops['stop_sequence'] == next_seq]
-    
+
     if not next_row.empty:
         stop_id = next_row.iloc[0]['stop_id']
         name_row = stops[stops['stop_id'] == stop_id]
         if not name_row.empty:
             return name_row.iloc[0]['stop_name']
-    
+
     if current_stop_sequence == trip_stops['stop_sequence'].max():
         return "Terminus atteint"
-    
+
     return "Prochain arrêt inconnu"
 
 def estimate_delay_from_position(trip_id, stop_sequence, position_time, now_datetime, gtfs_data):
+    """Estime le retard en secondes pour un arrêt donné."""
     stop_times = gtfs_data['stop_times']
     row = stop_times[(stop_times['trip_id'] == trip_id) & (stop_times['stop_sequence'] == stop_sequence)]
     if row.empty:
@@ -149,10 +142,8 @@ def estimate_delay_from_position(trip_id, stop_sequence, position_time, now_date
 
     return int((position_time - scheduled_dt).total_seconds())
 
-# ------------------------------------------------------------
-# Récupération flux RT
-# ------------------------------------------------------------
 def fetch_gtfs_rt(url):
+    """Récupère le flux GTFS-Realtime depuis une URL."""
     headers = {'User-Agent': 'RubanMonitor/4.0'}
     r = requests.get(url, headers=headers, timeout=15)
     r.raise_for_status()
@@ -160,10 +151,8 @@ def fetch_gtfs_rt(url):
     feed.ParseFromString(r.content)
     return feed
 
-# ------------------------------------------------------------
-# Analyse du flux realtime
-# ------------------------------------------------------------
 def analyze_realtime_feed(feed, now_datetime, gtfs_data):
+    """Analyse le flux GTFS-Realtime et retourne les véhicules, trips observés et doublons."""
     vehicles = {}
     observed_trips = set()
     vehicle_to_trips = defaultdict(set)
@@ -195,7 +184,7 @@ def analyze_realtime_feed(feed, now_datetime, gtfs_data):
         occupancy = occupancy_map.get(occupancy_code, "Non renseigné")
 
         delay_sec = 0
-        if seq:
+        if seq is not None:
             delay_sec = estimate_delay_from_position(trip_id, seq, pos_time, now_datetime, gtfs_data)
 
         next_stop_name = get_next_stop(trip_id, seq, gtfs_data)
@@ -216,32 +205,33 @@ def analyze_realtime_feed(feed, now_datetime, gtfs_data):
     duplicates = {label: trips for label, trips in vehicle_to_trips.items() if len(trips) > 1}
     return vehicles, observed_trips, duplicates
 
-# ------------------------------------------------------------
-# Historique retard
-# ------------------------------------------------------------
 def load_history():
+    """Charge l'historique des retards depuis un fichier JSON."""
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
-# ------------------------------------------------------------
-# Affichage
-# ------------------------------------------------------------
-def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplicates, history,
-                    alert_only=False, follow_vehicle=None, beep_enabled=True):
+def save_history(history):
+    """Sauvegarde l'historique des retards dans un fichier JSON."""
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False)
+
+def log_to_file(message):
+    """Écrit un message dans le fichier de log."""
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
+
+def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplicates, history, alert_only=False, follow_vehicle=None, beep_enabled=True):
+    """Affiche les résultats de l'analyse du flux GTFS-Realtime."""
     routes = gtfs_data['routes']
     trips = gtfs_data['trips']
     stop_times = gtfs_data['stop_times']
     now = datetime.now()
 
     missing = scheduled_trips - observed_trips
+    log_to_file(f"Véhicules: {len(vehicles)} | Absents: {len(missing)}")
 
-    # Log texte
-    with open("ruban_log.txt", "a", encoding="utf-8") as f:
-        f.write(f"{now.strftime('%Y-%m-%d %H:%M:%S')} | Véhicules: {len(vehicles)} | Absents: {len(missing)}\n")
-
-    # Mise à jour historique retard
     line_delays = defaultdict(list)
     for info in vehicles.values():
         delay_min = info['delay_seconds'] // 60
@@ -254,12 +244,10 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
             history[route_id] = []
         history[route_id].append((now.strftime('%H:%M'), avg))
 
-    # Alertes
     has_problem = bool(missing or duplicates or any(abs(v['delay_seconds']) > 600 for v in vehicles.values()))
     if has_problem and beep_enabled:
         print("\a")
 
-    # Mode alert-only
     if alert_only:
         if has_problem:
             if missing:
@@ -279,7 +267,6 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
             print(Fore.GREEN + "✅ Tout est nominal")
         return
 
-    # Affichage normal
     print(Fore.CYAN + Style.BRIGHT + f"\n=== {len(vehicles)} véhicule(s) en ligne à {now.strftime('%H:%M:%S')} ===\n")
 
     displayed = vehicles.values()
@@ -292,10 +279,8 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
     for info in sorted(displayed, key=lambda x: x['label']):
         trip_row = trips[trips['trip_id'] == info['trip_id']].iloc[0]
         dest = trip_row.get('trip_headsign', "?")
-
         route_row = routes[routes['route_id'] == info['route_id']]
         ligne = route_row['route_short_name'].iloc[0] if not route_row.empty else info['route_id']
-
         depart = stop_times[stop_times['trip_id'] == info['trip_id']].sort_values('stop_sequence').iloc[0]['departure_time']
 
         delay_sec = info['delay_seconds']
@@ -343,10 +328,7 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
     else:
         print(Fore.GREEN + Style.BRIGHT + "✓ Toutes les courses sont détectées")
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
-if __name__ == "__main__":
+def main():
     parser = argparse.ArgumentParser(description="Moniteur Ruban - Version Linux sans notifications Windows")
     parser.add_argument("zip_path", help="Chemin vers le fichier GTFS.zip")
     parser.add_argument("rt_url", help="URL du flux GTFS-Realtime")
@@ -375,8 +357,7 @@ if __name__ == "__main__":
                 beep_enabled=not args.no_beep
             )
 
-            with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-                json.dump(history, f, ensure_ascii=False)
+            save_history(history)
 
         except Exception as e:
             print(Fore.RED + f"Erreur : {e}")
@@ -386,3 +367,6 @@ if __name__ == "__main__":
         if args.interval > 0:
             print(f"\nProchaine mise à jour dans {args.interval} secondes...\n")
             time.sleep(args.interval)
+
+if __name__ == "__main__":
+    main()
