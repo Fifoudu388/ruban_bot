@@ -66,7 +66,6 @@ pandas
 requests
 gtfs-realtime-bindings
 colorama
-win10toast
 ```
 
 ---
