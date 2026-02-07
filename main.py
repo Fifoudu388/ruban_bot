@@ -1,28 +1,62 @@
 import argparse
+import json
+import os
+import time
 import zipfile
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
 import pandas as pd
 import requests
+from colorama import Fore, Style, init
 from google.transit import gtfs_realtime_pb2
-from datetime import datetime, timedelta
-import sys
-import time
-import os
-import json
-from collections import defaultdict
-from colorama import init, Fore, Style
 
 init(autoreset=True)
 
 HISTORY_FILE = "ruban_history.json"
 LOG_FILE = "ruban_log.txt"
+DEFAULT_HEADERS = {"User-Agent": "RubanMonitor/4.1"}
+REQUEST_TIMEOUT_SECONDS = 15
+REQUIRED_GTFS_FILES = [
+    "routes.txt",
+    "trips.txt",
+    "stop_times.txt",
+    "stops.txt",
+    "calendar.txt",
+]
+REQUIRED_COLUMNS = {
+    "routes": {"route_id", "route_short_name"},
+    "trips": {"trip_id", "route_id", "service_id"},
+    "stop_times": {"trip_id", "stop_sequence", "arrival_time", "departure_time", "stop_id"},
+    "stops": {"stop_id", "stop_name"},
+    "calendar": {
+        "service_id",
+        "start_date",
+        "end_date",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+        "sunday",
+    },
+}
+
+
+@dataclass(frozen=True)
+class TripDisplay:
+    ligne: str
+    destination: str
+    depart: str
 
 def load_gtfs_data(zip_path):
     """Charge les données GTFS depuis un fichier zip et retourne un dictionnaire de DataFrames."""
     try:
         with zipfile.ZipFile(zip_path, 'r') as z:
-            required = ['routes.txt', 'trips.txt', 'stop_times.txt', 'stops.txt', 'calendar.txt']
             gtfs_data = {}
-            for file in required:
+            for file in REQUIRED_GTFS_FILES:
                 if file not in z.namelist():
                     raise FileNotFoundError(f"Fichier manquant : {file}")
                 gtfs_data[file.split('.')[0]] = pd.read_csv(z.open(file))
@@ -36,10 +70,21 @@ def load_gtfs_data(zip_path):
             gtfs_data['calendar']['start_date'] = pd.to_numeric(gtfs_data['calendar']['start_date'], errors='coerce').fillna(0).astype(int)
             gtfs_data['calendar']['end_date'] = pd.to_numeric(gtfs_data['calendar']['end_date'], errors='coerce').fillna(0).astype(int)
 
+            validate_gtfs_columns(gtfs_data)
             return gtfs_data
     except Exception as e:
         print(Fore.RED + f"Erreur lors du chargement du GTFS : {e}")
         raise
+
+def validate_gtfs_columns(gtfs_data):
+    """Valide la présence des colonnes requises dans les fichiers GTFS."""
+    for key, required_columns in REQUIRED_COLUMNS.items():
+        df = gtfs_data.get(key)
+        if df is None:
+            raise KeyError(f"Fichier GTFS manquant dans les données chargées : {key}.txt")
+        missing = required_columns - set(df.columns)
+        if missing:
+            raise ValueError(f"Colonnes manquantes dans {key}.txt : {', '.join(sorted(missing))}")
 
 def get_active_service_ids(gtfs_data, today_date):
     """Retourne les IDs des services actifs pour la date donnée."""
@@ -144,8 +189,7 @@ def estimate_delay_from_position(trip_id, stop_sequence, position_time, now_date
 
 def fetch_gtfs_rt(url):
     """Récupère le flux GTFS-Realtime depuis une URL."""
-    headers = {'User-Agent': 'RubanMonitor/4.0'}
-    r = requests.get(url, headers=headers, timeout=15)
+    r = requests.get(url, headers=DEFAULT_HEADERS, timeout=REQUEST_TIMEOUT_SECONDS)
     r.raise_for_status()
     feed = gtfs_realtime_pb2.FeedMessage()
     feed.ParseFromString(r.content)
@@ -222,11 +266,28 @@ def log_to_file(message):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | {message}\n")
 
-def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplicates, history, alert_only=False, follow_vehicle=None, beep_enabled=True):
-    """Affiche les résultats de l'analyse du flux GTFS-Realtime."""
+def get_trip_display(trip_id, gtfs_data):
+    """Construit les informations d'affichage d'un trip en sécurité."""
     routes = gtfs_data['routes']
     trips = gtfs_data['trips']
     stop_times = gtfs_data['stop_times']
+
+    trip_rows = trips[trips['trip_id'] == trip_id]
+    if trip_rows.empty:
+        return TripDisplay(ligne="?", destination="?", depart="?")
+
+    trip_row = trip_rows.iloc[0]
+    destination = trip_row.get('trip_headsign', "?")
+    route_rows = routes[routes['route_id'] == trip_row['route_id']]
+    ligne = route_rows['route_short_name'].iloc[0] if not route_rows.empty else trip_row['route_id']
+
+    stop_rows = stop_times[stop_times['trip_id'] == trip_id].sort_values('stop_sequence')
+    depart = stop_rows.iloc[0]['departure_time'] if not stop_rows.empty else "?"
+
+    return TripDisplay(ligne=ligne, destination=destination, depart=depart)
+
+def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplicates, history, alert_only=False, follow_vehicle=None, beep_enabled=True):
+    """Affiche les résultats de l'analyse du flux GTFS-Realtime."""
     now = datetime.now()
 
     missing = scheduled_trips - observed_trips
@@ -253,12 +314,8 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
             if missing:
                 print(Fore.RED + Style.BRIGHT + f"🚨 {len(missing)} COURSE(S) ABSENTE(S)")
                 for trip_id in sorted(missing):
-                    t = trips[trips['trip_id'] == trip_id].iloc[0]
-                    r = routes[routes['route_id'] == t['route_id']]
-                    ligne = r['route_short_name'].iloc[0] if not r.empty else "?"
-                    dest = t.get('trip_headsign', "?")
-                    heure = stop_times[stop_times['trip_id'] == trip_id].sort_values('stop_sequence').iloc[0]['departure_time']
-                    print(Fore.RED + f"   ❌ {ligne} | Départ {heure} → {dest}")
+                    info = get_trip_display(trip_id, gtfs_data)
+                    print(Fore.RED + f"   ❌ {info.ligne} | Départ {info.depart} → {info.destination}")
             if duplicates:
                 print(Fore.MAGENTA + "⚡ DOUBLONS DÉTECTÉS")
                 for label, trips in duplicates.items():
@@ -277,11 +334,7 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
             return
 
     for info in sorted(displayed, key=lambda x: x['label']):
-        trip_row = trips[trips['trip_id'] == info['trip_id']].iloc[0]
-        dest = trip_row.get('trip_headsign', "?")
-        route_row = routes[routes['route_id'] == info['route_id']]
-        ligne = route_row['route_short_name'].iloc[0] if not route_row.empty else info['route_id']
-        depart = stop_times[stop_times['trip_id'] == info['trip_id']].sort_values('stop_sequence').iloc[0]['departure_time']
+        trip_display = get_trip_display(info['trip_id'], gtfs_data)
 
         delay_sec = info['delay_seconds']
         delay_min = abs(delay_sec) // 60
@@ -293,9 +346,9 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
         else:
             etat = Fore.GREEN + "à l'heure"
 
-        print(Fore.WHITE + Style.BRIGHT + f"Véhicule {info['label']} → " + Fore.CYAN + f"Ligne {ligne}")
-        print(f"   Destination : {dest}")
-        print(f"   Départ prévu : {depart}")
+        print(Fore.WHITE + Style.BRIGHT + f"Véhicule {info['label']} → " + Fore.CYAN + f"Ligne {trip_display.ligne}")
+        print(f"   Destination : {trip_display.destination}")
+        print(f"   Départ prévu : {trip_display.depart}")
         print(f"   Statut : {info['status']} | État : {etat}")
         print(Fore.MAGENTA + f"   Prochain arrêt : {info['next_stop']}")
         print(f"   Occupation : {info['occupancy']}")
@@ -307,6 +360,7 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
         for route_id, records in history.items():
             if records:
                 avg = sum(r[1] for r in records) / len(records)
+                routes = gtfs_data['routes']
                 ligne_name = routes[routes['route_id'] == route_id]['route_short_name'].iloc[0] if route_id in routes['route_id'].values else route_id
                 color = Fore.GREEN if avg < 3 else Fore.YELLOW if avg < 8 else Fore.RED
                 print(f"   {ligne_name} → {color}{avg:.1f} min")
@@ -319,12 +373,8 @@ def display_results(vehicles, observed_trips, scheduled_trips, gtfs_data, duplic
     if missing:
         print(Fore.RED + Style.BRIGHT + f"🚨 {len(missing)} course(s) ABSENTE(S)")
         for trip_id in sorted(missing):
-            t = trips[trips['trip_id'] == trip_id].iloc[0]
-            r = routes[routes['route_id'] == t['route_id']]
-            ligne = r['route_short_name'].iloc[0] if not r.empty else "?"
-            dest = t.get('trip_headsign', "?")
-            heure = stop_times[stop_times['trip_id'] == trip_id].sort_values('stop_sequence').iloc[0]['departure_time']
-            print(Fore.RED + f"   ❌ {ligne} | Départ {heure} → {dest}")
+            info = get_trip_display(trip_id, gtfs_data)
+            print(Fore.RED + f"   ❌ {info.ligne} | Départ {info.depart} → {info.destination}")
     else:
         print(Fore.GREEN + Style.BRIGHT + "✓ Toutes les courses sont détectées")
 
@@ -336,16 +386,19 @@ def main():
     parser.add_argument("--alert-only", action="store_true", help="Afficher uniquement les alertes")
     parser.add_argument("--follow", type=str, help="Suivre un seul véhicule (numéro)")
     parser.add_argument("--no-beep", action="store_true", help="Désactiver le beep console")
+    parser.add_argument("--refresh-gtfs", action="store_true", help="Recharger le GTFS à chaque cycle")
     args = parser.parse_args()
 
     history = load_history()
+    gtfs_data = None
 
     while True:
         now = datetime.now()
         print(Fore.WHITE + Style.BRIGHT + f"Analyse Ruban — {now.strftime('%d/%m/%Y %H:%M:%S')}")
 
         try:
-            gtfs_data = load_gtfs_data(args.zip_path)
+            if gtfs_data is None or args.refresh_gtfs:
+                gtfs_data = load_gtfs_data(args.zip_path)
             feed = fetch_gtfs_rt(args.rt_url)
             vehicles, observed, duplicates = analyze_realtime_feed(feed, now, gtfs_data)
             scheduled = get_scheduled_trips_now(gtfs_data, now)

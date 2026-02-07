@@ -66,6 +66,7 @@ pandas
 requests
 gtfs-realtime-bindings
 colorama
+flask
 ```
 
 ---
@@ -77,6 +78,14 @@ colorama
 ```bash
 python main.py gtfs.zip https://app.pysae.com/api/v2/groups/keolis-9cc4/gtfs-rt
 ```
+
+### Dashboard web (itinéraire temps réel)
+
+```bash
+python dashboard.py --zip-path gtfs.zip --rt-url https://app.pysae.com/api/v2/groups/keolis-9cc4/gtfs-rt --port 8000
+```
+
+Puis ouvrir `http://localhost:8000` dans un navigateur.
 
 ### Options disponibles
 
